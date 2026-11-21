@@ -29,8 +29,8 @@ jobs:
         if: steps.spec.outputs.changed == 'true'
         id: diff
         run: |
-          docker run --rm -v "$PWD:/a" -v /tmp:/t tufin/oasdiff changelog /a/openapi.json /t/live.json > /tmp/changelog.txt || true
-          docker run --rm -v "$PWD:/a" -v /tmp:/t tufin/oasdiff breaking /a/openapi.json /t/live.json --fail-on ERR > /tmp/breaking.txt && echo "breaking=false" >> "$GITHUB_OUTPUT" || echo "breaking=true" >> "$GITHUB_OUTPUT"
+          docker run --rm -v "$PWD:/a" -v /tmp:/t tufin/oasdiff:v1.38.0 changelog /a/openapi.json /t/live.json > /tmp/changelog.txt || true
+          docker run --rm -v "$PWD:/a" -v /tmp:/t tufin/oasdiff:v1.38.0 breaking /a/openapi.json /t/live.json --fail-on ERR > /tmp/breaking.txt && echo "breaking=false" >> "$GITHUB_OUTPUT" || echo "breaking=true" >> "$GITHUB_OUTPUT"
       - name: Commit the snapshot
         if: steps.spec.outputs.changed == 'true'
         run: |
