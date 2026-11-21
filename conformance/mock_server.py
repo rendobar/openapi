@@ -15,13 +15,15 @@ deserializer sees data the spec says is valid. Scenario ids exercise behaviour:
   GET /jobs/job_501      -> 501 every time (must not be retried)
   GET /jobs/job_409      -> 409 every time (must not be retried)
   GET /jobs/job_slow     -> 200 after 6 s (client timeout test)
-  GET /jobs/job_future   -> 200 with status "paused" (new enum value) + unknown field
+  GET /jobs/job_future   -> 200 with status "paused" (new enum value), terminal false, + unknown field
+  GET /jobs/job_future_done -> 200 with status "archived" (new enum value), terminal true, + unknown field
   GET /jobs/job_done     -> 200, a complete job with an output file
   GET /jobs/job_failed   -> 200, a failed job with an error code and message
   GET /jobs/job_stuck    -> 200, a running job, every time
   GET /jobs/job_cancelled -> 200, a cancelled job (JobCancelled, which has no error object)
   GET /jobs/<created id> -> a job POST /jobs created: running on the first poll, complete after
-                            (cancelled after, for a job created after /__reset?cancel_created=1)
+                            (cancelled after, for a job created after /__reset?cancel_created=1,
+                            archived after, for a job created after /__reset?archive_created=1)
   GET /jobs?limit&offset -> 120 jobs total, paginated, limit clamped to 100; after
                             /__reset?phantom_total=1 the total stays 120 but no job
                             exists from offset 60
@@ -39,11 +41,12 @@ deserializer sees data the spec says is valid. Scenario ids exercise behaviour:
   every response           -> X-Request-Id: req_conformance_<n>
   POST /__reset           -> clears hit counters, created jobs and the request list, and
                              sets the flags named =1 in its query: lose_submit,
-                             stall_submit, phantom_total, cancel_created
+                             stall_submit, phantom_total, cancel_created, archive_created
   GET /__created          -> {data: {count}}: jobs POST /jobs created since the reset
   GET /__requests         -> {data: [{method, path, query, idempotencyKey (from the body)}]}: every
                              request since the reset except /__ control calls, with the
                              path exactly as sent (a doubled slash stays doubled)
+Every job carries terminal: true for complete, failed, cancelled (and archived), false otherwise.
 Every request is appended to the log file (method, path, query, selected headers).
 
 Run: python3 -I mock_server.py <spec> <port> <logfile>
@@ -57,9 +60,13 @@ PORT = int(sys.argv[2])
 LOG = sys.argv[3]
 HITS = {}
 CREATED = {}  # idempotency key -> (job id, hash of the submit's type, inputs and params)
-CANCELLING = set()  # created job ids that end cancelled instead of complete
+ENDINGS = {}  # created job id -> the status it ends in when not "complete"
 REQUESTS = []  # every non-control request since the last reset
-FLAGS = ("lose_submit", "stall_submit", "phantom_total", "cancel_created")
+FLAGS = ("lose_submit", "stall_submit", "phantom_total", "cancel_created", "archive_created")
+VARIANTS = {"waiting": "JobWaiting", "dispatched": "JobDispatched", "running": "JobRunning",
+            "complete": "JobComplete", "failed": "JobFailed", "cancelled": "JobCancelled"}
+# "paused" and "archived" stand for statuses an SDK does not know yet: one still going, one ended.
+TERMINAL = {"complete", "failed", "cancelled", "archived"}
 STATE = dict({f: False for f in FLAGS}, seq=0)
 
 
@@ -71,10 +78,16 @@ def resolve(s):
 
 
 def job_of(status):
-    """A synthesized job in one status, from that status's own variant schema."""
-    name = {"waiting": "JobWaiting", "running": "JobRunning", "complete": "JobComplete",
-            "failed": "JobFailed", "cancelled": "JobCancelled"}[status]
-    return synth({"$ref": f"#/components/schemas/{name}"})
+    """A synthesized job in one status, from that status's own variant schema.
+
+    A status the spec does not know reuses the waiting variant's fields and adds an unknown one.
+    """
+    job = synth({"$ref": f"#/components/schemas/{VARIANTS.get(status, 'JobWaiting')}"})
+    job["status"] = status
+    job["terminal"] = status in TERMINAL
+    if status not in VARIANTS:
+        job["brandNewField"] = {"added": "later"}
+    return job
 
 
 def synth(s, key="", depth=0):
@@ -110,7 +123,7 @@ def synth(s, key="", depth=0):
     if t == "integer":
         return 1731000000000 if timestamp else 1
     if t == "number":
-        return 1731000000000 if timestamp else 1.5
+        return 1731000000000 if timestamp else 0.5  # in range for a 0..1 fraction such as progress
     if t == "boolean":
         return True
     if t == "null":
@@ -212,7 +225,7 @@ class H(BaseHTTPRequestHandler):
             }) + "\n")
 
         if path == "/__reset":
-            HITS.clear(); CREATED.clear(); CANCELLING.clear(); REQUESTS.clear()
+            HITS.clear(); CREATED.clear(); ENDINGS.clear(); REQUESTS.clear()
             flags = parse_qs(query)
             for f in FLAGS:
                 STATE[f] = flags.get(f) == ["1"]
@@ -240,7 +253,9 @@ class H(BaseHTTPRequestHandler):
             job_id = f"job_{len(CREATED) + 1:04d}"
             CREATED[key if key is not None else f"__nokey_{job_id}"] = (job_id, submit_hash(req))
             if STATE["cancel_created"]:
-                CANCELLING.add(job_id)
+                ENDINGS[job_id] = "cancelled"
+            if STATE["archive_created"]:
+                ENDINGS[job_id] = "archived"
             if STATE["lose_submit"]:
                 STATE["lose_submit"] = False
                 return self.send(502, err("BAD_GATEWAY", "The response was lost after the job was created"))
@@ -284,9 +299,10 @@ class H(BaseHTTPRequestHandler):
                 if arg == "job_slow":
                     time.sleep(6)
                 status = {"job_done": "complete", "job_failed": "failed", "job_stuck": "running",
-                          "job_cancelled": "cancelled"}.get(arg)
+                          "job_cancelled": "cancelled", "job_future": "paused",
+                          "job_future_done": "archived"}.get(arg)
                 if status is None and arg in {job_id for job_id, _ in CREATED.values()}:
-                    status = "running" if first else ("cancelled" if arg in CANCELLING else "complete")
+                    status = "running" if first else ENDINGS.get(arg, "complete")
                 if status is not None:
                     job = job_of(status)
                     job["id"] = arg
@@ -296,14 +312,12 @@ class H(BaseHTTPRequestHandler):
             status, payload = success(op)
             if p == "/jobs/{id}" and isinstance(payload, dict) and isinstance(payload.get("data"), dict):
                 payload["data"]["id"] = arg
-                if arg == "job_future":
-                    payload["data"]["status"] = "paused"
-                    payload["data"]["brandNewField"] = {"added": "later"}
+                payload["data"]["terminal"] = payload["data"].get("status") in TERMINAL
             if p == "/jobs" and method == "GET" and isinstance(payload, dict):
                 qs = parse_qs(query)
                 limit = min(int((qs.get("limit") or ["50"])[0]), 100)  # the API's maximum page size
                 offset = int((qs.get("offset") or ["0"])[0])
-                item = payload["data"][0]
+                item = dict(payload["data"][0], terminal=payload["data"][0].get("status") in TERMINAL)
                 present = 60 if STATE["phantom_total"] else 120  # phantom_total: the total counts jobs that are gone
                 count = max(0, min(limit, present - offset))
                 payload["data"] = [dict(item, id=f"job_{offset + i:04d}") for i in range(count)]
