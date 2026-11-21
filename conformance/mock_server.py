@@ -9,35 +9,58 @@ deserializer sees data the spec says is valid. Scenario ids exercise behaviour:
   GET /jobs/job_404      -> 404 error envelope
   GET /jobs/job_flaky    -> 429 (Retry-After: 1) on the first hit, 200 after
   GET /jobs/job_503      -> 503 every time (retry exhaustion)
+  GET /jobs/job_503_ra   -> 503 (Retry-After: 1) on the first hit, 200 after
+  GET /jobs/job_ra_long  -> 429 (Retry-After: 3600) every time
+  GET /jobs/job_ra_date  -> 429 on the first hit, Retry-After an HTTP-date 1 to 2 s ahead; 200 after
+  GET /jobs/job_501      -> 501 every time (must not be retried)
   GET /jobs/job_409      -> 409 every time (must not be retried)
   GET /jobs/job_slow     -> 200 after 6 s (client timeout test)
   GET /jobs/job_future   -> 200 with status "paused" (new enum value) + unknown field
   GET /jobs/job_done     -> 200, a complete job with an output file
   GET /jobs/job_failed   -> 200, a failed job with an error code and message
+  GET /jobs/job_stuck    -> 200, a running job, every time
+  GET /jobs/job_cancelled -> 200, a cancelled job (JobCancelled, which has no error object)
   GET /jobs/<created id> -> a job POST /jobs created: running on the first poll, complete after
-  GET /jobs?limit&offset -> 120 jobs total, paginated
+                            (cancelled after, for a job created after /__reset?cancel_created=1)
+  GET /jobs?limit&offset -> 120 jobs total, paginated, limit clamped to 100; after
+                            /__reset?phantom_total=1 the total stays 120 but no job
+                            exists from offset 60
   GET /jobs/{id}/download -> 1 KiB of bytes, video/mp4
-  POST /jobs              -> 400 without a string `type` or with non-object `params`;
-                             dedupes on idempotencyKey like the real API; the
-                             first submit after /__reset?lose_submit=1 is
-                             created and then answered with a 502 (lost response)
+  POST /jobs              -> 400 VALIDATION_ERROR with details [{path, message}] without
+                             a string `type`, with non-object `params`, or with the
+                             type "no_such_type"; dedupes on idempotencyKey like the
+                             real API, and a reused key whose type or params differ is
+                             a 409 CONFLICT with details {jobId}; the first submit after
+                             /__reset?lose_submit=1 is created and then answered with a
+                             502 (lost response); the first submit after
+                             /__reset?stall_submit=1 is created and then answered only
+                             after 6 s (a client timeout cuts it off)
   deprecated operations    -> Deprecation: @<x-deprecated-since> (RFC 9745)
   every response           -> X-Request-Id: req_conformance_<n>
-  POST /__reset           -> clears hit counters and created jobs
+  POST /__reset           -> clears hit counters, created jobs and the request list, and
+                             sets the flags named =1 in its query: lose_submit,
+                             stall_submit, phantom_total, cancel_created
+  GET /__created          -> {data: {count}}: jobs POST /jobs created since the reset
+  GET /__requests         -> {data: [{method, path, query, idempotencyKey (from the body)}]}: every
+                             request since the reset except /__ control calls, with the
+                             path exactly as sent (a doubled slash stays doubled)
 Every request is appended to the log file (method, path, query, selected headers).
 
 Run: python3 -I mock_server.py <spec> <port> <logfile>
 """
-import json, sys, time, re
+import email.utils, hashlib, json, sys, time, re
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs
 
 SPEC = json.load(open(sys.argv[1]))
 PORT = int(sys.argv[2])
 LOG = sys.argv[3]
 HITS = {}
-CREATED = {}
-STATE = {"lose_submit": False, "seq": 0}
+CREATED = {}  # idempotency key -> (job id, hash of the submit's type and params)
+CANCELLING = set()  # created job ids that end cancelled instead of complete
+REQUESTS = []  # every non-control request since the last reset
+FLAGS = ("lose_submit", "stall_submit", "phantom_total", "cancel_created")
+STATE = dict({f: False for f in FLAGS}, seq=0)
 
 
 def resolve(s):
@@ -49,7 +72,8 @@ def resolve(s):
 
 def job_of(status):
     """A synthesized job in one status, from that status's own variant schema."""
-    name = {"waiting": "JobWaiting", "running": "JobRunning", "complete": "JobComplete", "failed": "JobFailed"}[status]
+    name = {"waiting": "JobWaiting", "running": "JobRunning", "complete": "JobComplete",
+            "failed": "JobFailed", "cancelled": "JobCancelled"}[status]
     return synth({"$ref": f"#/components/schemas/{name}"})
 
 
@@ -119,8 +143,28 @@ def success(op):
     return 200, None
 
 
-def err(code, msg):
-    return {"error": {"code": code, "message": msg}}
+def err(code, msg, details=None):
+    body = {"code": code, "message": msg}
+    if details is not None:
+        body["details"] = details
+    return {"error": body}
+
+
+def invalid(path, msg):
+    return err("VALIDATION_ERROR", msg, [{"path": path, "message": msg}])
+
+
+def body_key(body):
+    """The idempotencyKey a JSON request body carries, or None."""
+    try:
+        req = json.loads(body)
+    except ValueError:
+        return None
+    return req.get("idempotencyKey") if isinstance(req, dict) else None
+
+
+def submit_hash(req):
+    return hashlib.sha256(json.dumps([req.get("type"), req.get("params", {})], sort_keys=True).encode()).hexdigest()
 
 
 class H(BaseHTTPRequestHandler):
@@ -144,14 +188,19 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def handle_any(self, method):
-        u = urlparse(self.path)
+        # The target exactly as sent. self.path has a leading "//" collapsed to "/" (Python 3.12+),
+        # which would hide the doubled slash a base URL with a trailing "/" produces.
+        target = self.requestline.split(" ")[1] if self.requestline.count(" ") >= 2 else self.path
+        path, _, query = target.partition("?")
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
-        HITS[u.path] = HITS.get(u.path, 0) + 1
+        HITS[path] = HITS.get(path, 0) + 1
+        if not path.startswith("/__"):
+            REQUESTS.append({"method": method, "path": path, "query": query, "idempotencyKey": body_key(body)})
         with open(LOG, "a") as f:
             f.write(json.dumps({
-                "t": time.time(), "m": method, "path": u.path, "q": u.query,
-                "hit": HITS[u.path],
+                "t": time.time(), "m": method, "path": path, "q": query,
+                "hit": HITS[path],
                 "ua": self.headers.get("User-Agent"),
                 "auth": (self.headers.get("Authorization") or "")[:12],
                 "client": self.headers.get("X-Rendobar-Client"),
@@ -161,33 +210,50 @@ class H(BaseHTTPRequestHandler):
                 "body": body.decode(errors="replace")[:400],
             }) + "\n")
 
-        if u.path == "/__reset":
-            HITS.clear(); CREATED.clear()
-            STATE["lose_submit"] = "lose_submit=1" in u.query
+        if path == "/__reset":
+            HITS.clear(); CREATED.clear(); CANCELLING.clear(); REQUESTS.clear()
+            flags = parse_qs(query)
+            for f in FLAGS:
+                STATE[f] = flags.get(f) == ["1"]
             return self.send(204)
-        if u.path == "/jobs" and method == "POST":
+        if path == "/jobs" and method == "POST":
             if not (self.headers.get("Authorization") or "").startswith("Bearer "):
                 return self.send(401, err("UNAUTHORIZED", "Missing or invalid API key"))
             try:
                 req = json.loads(body or b"{}")
             except ValueError:
-                return self.send(400, err("VALIDATION_ERROR", "Body is not JSON"))
-            if not isinstance(req, dict) or not isinstance(req.get("type"), str) or not isinstance(req.get("params", {}), dict):
-                return self.send(400, err("VALIDATION_ERROR", "A submit needs a string type and an object params"))
+                return self.send(400, invalid("", "Body is not JSON"))
+            if not isinstance(req, dict) or not isinstance(req.get("type"), str):
+                return self.send(400, invalid("type", "A submit needs a string type"))
+            if not isinstance(req.get("params", {}), dict):
+                return self.send(400, invalid("params", "params must be an object"))
+            if req["type"] == "no_such_type":
+                return self.send(400, invalid("type", 'Unknown job type "no_such_type"'))
             key = req.get("idempotencyKey")
             if key is not None and key in CREATED:
-                return self.send(200, {"data": {"id": CREATED[key], "status": "waiting", "idempotent": True}})
+                job_id, digest = CREATED[key]
+                if digest != submit_hash(req):
+                    return self.send(409, err("CONFLICT", f'Idempotency key "{key}" is already bound to job {job_id}, '
+                                              "submitted with a different type or params. Use a new key.", {"jobId": job_id}))
+                return self.send(200, {"data": {"id": job_id, "status": "waiting", "idempotent": True}})
             job_id = f"job_{len(CREATED) + 1:04d}"
-            CREATED[key if key is not None else f"__nokey_{job_id}"] = job_id
+            CREATED[key if key is not None else f"__nokey_{job_id}"] = (job_id, submit_hash(req))
+            if STATE["cancel_created"]:
+                CANCELLING.add(job_id)
             if STATE["lose_submit"]:
                 STATE["lose_submit"] = False
                 return self.send(502, err("BAD_GATEWAY", "The response was lost after the job was created"))
+            if STATE["stall_submit"]:
+                STATE["stall_submit"] = False
+                time.sleep(6)  # the job exists; the client times out before this answer
             return self.send(201, {"data": {"id": job_id, "status": "waiting"}})
-        if u.path == "/__created" and method == "GET":
+        if path == "/__created" and method == "GET":
             return self.send(200, {"data": {"count": len(CREATED)}})
+        if path == "/__requests" and method == "GET":
+            return self.send(200, {"data": list(REQUESTS)})
 
         for m, rx, p, op in ROUTES:
-            mm = rx.match(u.path)
+            mm = rx.match(path)
             if m != method or not mm:
                 continue
             secured = op.get("security", SPEC.get("security")) not in ([], None)
@@ -201,13 +267,25 @@ class H(BaseHTTPRequestHandler):
                     return self.send(409, err("CONFLICT", "The job is in a state that does not allow this"))
                 if arg == "job_503":
                     return self.send(503, err("SERVICE_UNAVAILABLE", "Try again"))
-                if arg == "job_flaky" and HITS[u.path] == 1:
+                if arg == "job_501":
+                    return self.send(501, err("NOT_IMPLEMENTED", "Not implemented"))
+                if arg == "job_ra_long":
+                    return self.send(429, err("RATE_LIMITED", "Slow down"), {"Retry-After": "3600"})
+                first = HITS[path] == 1
+                if arg == "job_flaky" and first:
                     return self.send(429, err("RATE_LIMITED", "Slow down"), {"Retry-After": "1"})
+                if arg == "job_503_ra" and first:
+                    return self.send(503, err("SERVICE_UNAVAILABLE", "Try again"), {"Retry-After": "1"})
+                if arg == "job_ra_date" and first:
+                    # Two whole seconds after the current second: 1 to 2 s from now.
+                    when = email.utils.formatdate(int(time.time()) + 2, usegmt=True)
+                    return self.send(429, err("RATE_LIMITED", "Slow down"), {"Retry-After": when})
                 if arg == "job_slow":
                     time.sleep(6)
-                status = {"job_done": "complete", "job_failed": "failed"}.get(arg)
-                if status is None and arg in CREATED.values():
-                    status = "running" if HITS[u.path] == 1 else "complete"
+                status = {"job_done": "complete", "job_failed": "failed", "job_stuck": "running",
+                          "job_cancelled": "cancelled"}.get(arg)
+                if status is None and arg in {job_id for job_id, _ in CREATED.values()}:
+                    status = "running" if first else ("cancelled" if arg in CANCELLING else "complete")
                 if status is not None:
                     job = job_of(status)
                     job["id"] = arg
@@ -221,11 +299,12 @@ class H(BaseHTTPRequestHandler):
                     payload["data"]["status"] = "paused"
                     payload["data"]["brandNewField"] = {"added": "later"}
             if p == "/jobs" and method == "GET" and isinstance(payload, dict):
-                qs = parse_qs(u.query)
-                limit = int((qs.get("limit") or ["50"])[0])
+                qs = parse_qs(query)
+                limit = min(int((qs.get("limit") or ["50"])[0]), 100)  # the API's maximum page size
                 offset = int((qs.get("offset") or ["0"])[0])
                 item = payload["data"][0]
-                count = max(0, min(limit, 120 - offset))
+                present = 60 if STATE["phantom_total"] else 120  # phantom_total: the total counts jobs that are gone
+                count = max(0, min(limit, present - offset))
                 payload["data"] = [dict(item, id=f"job_{offset + i:04d}") for i in range(count)]
                 payload["meta"] = {"total": 120, "page": offset // max(limit, 1) + 1, "limit": limit}
             # Deprecated operations answer with RFC 9745 Deprecation, from the spec's own x-deprecated-since.
@@ -236,13 +315,19 @@ class H(BaseHTTPRequestHandler):
                 day = datetime.datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
                 extra["Deprecation"] = f"@{int(day.timestamp())}"
             return self.send(status, payload, extra)
-        self.send(404, err("NOT_FOUND", f"No route {method} {u.path}"))
+        self.send(404, err("NOT_FOUND", f"No route {method} {path}"))
 
-    def do_GET(self): self.handle_any("GET")
-    def do_POST(self): self.handle_any("POST")
-    def do_PATCH(self): self.handle_any("PATCH")
-    def do_DELETE(self): self.handle_any("DELETE")
-    def do_PUT(self): self.handle_any("PUT")
+    def answer(self, method):
+        try:
+            self.handle_any(method)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # the client gave up first (a timeout scenario): nothing left to answer
+
+    def do_GET(self): self.answer("GET")
+    def do_POST(self): self.answer("POST")
+    def do_PATCH(self): self.answer("PATCH")
+    def do_DELETE(self): self.answer("DELETE")
+    def do_PUT(self): self.answer("PUT")
 
 
 ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
