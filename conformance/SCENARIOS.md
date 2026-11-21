@@ -24,6 +24,9 @@ Run the mock: `python3 mock_server.py openapi.json <port> <requests.jsonl>`.
 | C13 | submit with no key after `/__reset?lose_submit=1` | send one generated key on every retry; `GET /__created` reports exactly 1 job |
 | C14 | call a deprecated operation twice through the SDK (TS: `billing.checkoutPro()`) | surface the `Deprecation` header once, and stay silent on a current endpoint |
 | C15 | client with no key while `RENDOBAR_API_KEY` is set | send that key |
+| C16 | `run` an `ffprobe` job (the mock reports it `running`, then `complete`) | return the complete job, with its output file URL |
+| C17 | `wait("job_failed")` with failures raised | raise a typed job-failed error carrying the job's error code |
+| C18 | `getJob("job_409")` | raise a typed 409 error after exactly one request (a conflict is not retried) |
 
 An SDK reports results as JSON `{ "C01": "pass" | "fail: <why>", ... }` and CI
 fails on any id that is missing or not `pass`.

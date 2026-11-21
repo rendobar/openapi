@@ -1,7 +1,9 @@
 name: sync
 # Snapshots the published spec from production every hour, with a changelog of
-# what changed. A breaking change opens an issue: by then it is live, so this
-# is the alarm, and the API repo's own pre-push check is the gate.
+# what changed. A breaking change opens an issue: by then it is live, so this is
+# the alarm. The gate is the API's own deploy, which runs oasdiff before it ships.
+# Runs at :07, before the SDK repos regenerate (:17 Python, :27 Go), so their CI
+# builds the mock from the spec they were generated from.
 on:
   schedule:
     - cron: "7 * * * *"
@@ -30,19 +32,39 @@ jobs:
         id: diff
         run: |
           docker run --rm -v "$PWD:/a" -v /tmp:/t tufin/oasdiff:v1.38.0 changelog /a/openapi.json /t/live.json > /tmp/changelog.txt || true
-          docker run --rm -v "$PWD:/a" -v /tmp:/t tufin/oasdiff:v1.38.0 breaking /a/openapi.json /t/live.json --fail-on ERR > /tmp/breaking.txt && echo "breaking=false" >> "$GITHUB_OUTPUT" || echo "breaking=true" >> "$GITHUB_OUTPUT"
+          # oasdiff exits 1 on a breaking change. Any other non-zero is a failure of the tool, not the spec.
+          set +e
+          docker run --rm -v "$PWD:/a" -v /tmp:/t tufin/oasdiff:v1.38.0 breaking /a/openapi.json /t/live.json --fail-on ERR > /tmp/breaking.txt
+          code=$?
+          set -e
+          case $code in
+            0) echo "breaking=false" >> "$GITHUB_OUTPUT" ;;
+            1) echo "breaking=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "oasdiff failed with exit $code"; exit 1 ;;
+          esac
+      - name: The mock still serves the new spec
+        if: steps.spec.outputs.changed == 'true'
+        run: |
+          # Every SDK's CI runs this mock, so a spec that breaks it must not be committed.
+          python3 -I conformance/mock_server.py /tmp/live.json 4100 /tmp/requests.jsonl &
+          for i in $(seq 1 20); do curl -sf -X POST http://127.0.0.1:4100/__reset && break; sleep 0.5; done
+          curl -sf http://127.0.0.1:4100/jobs/types > /dev/null
+          curl -sf -H "Authorization: Bearer k" http://127.0.0.1:4100/jobs/job_done > /dev/null
       - name: Commit the snapshot
         if: steps.spec.outputs.changed == 'true'
         run: |
           cp /tmp/live.json openapi.json
           { echo "## $(date -u +%Y-%m-%dT%H:%MZ)"; echo; cat /tmp/changelog.txt; echo; cat CHANGELOG.md 2>/dev/null; } > /tmp/cl.md && mv /tmp/cl.md CHANGELOG.md
           git config user.name "rendobar-bot" && git config user.email "bot@rendobar.com"
-          git add openapi.json CHANGELOG.md && git commit -m "chore: sync the published spec" && git push
+          git add openapi.json CHANGELOG.md && git commit -m "chore: sync the published spec"
+          git pull --rebase && git push
       - name: Alarm on a breaking change
         if: steps.diff.outputs.breaking == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue create --title "Breaking change in the published spec" --body-file /tmp/breaking.txt --label breaking
+        run: |
+          gh label create breaking --color B60205 --description "A breaking change in the published spec" 2>/dev/null || true
+          gh issue create --title "Breaking change in the published spec" --body-file /tmp/breaking.txt --label breaking
   live-check:
     runs-on: ubuntu-latest
     needs: sync

@@ -9,19 +9,24 @@ deserializer sees data the spec says is valid. Scenario ids exercise behaviour:
   GET /jobs/job_404      -> 404 error envelope
   GET /jobs/job_flaky    -> 429 (Retry-After: 1) on the first hit, 200 after
   GET /jobs/job_503      -> 503 every time (retry exhaustion)
+  GET /jobs/job_409      -> 409 every time (must not be retried)
   GET /jobs/job_slow     -> 200 after 6 s (client timeout test)
   GET /jobs/job_future   -> 200 with status "paused" (new enum value) + unknown field
+  GET /jobs/job_done     -> 200, a complete job with an output file
+  GET /jobs/job_failed   -> 200, a failed job with an error code and message
+  GET /jobs/<created id> -> a job POST /jobs created: running on the first poll, complete after
   GET /jobs?limit&offset -> 120 jobs total, paginated
   GET /jobs/{id}/download -> 1 KiB of bytes, video/mp4
-  POST /jobs              -> dedupes on idempotencyKey like the real API; the
+  POST /jobs              -> 400 without a string `type` or with non-object `params`;
+                             dedupes on idempotencyKey like the real API; the
                              first submit after /__reset?lose_submit=1 is
                              created and then answered with a 502 (lost response)
   deprecated operations    -> Deprecation: @<x-deprecated-since> (RFC 9745)
   every response           -> X-Request-Id: req_conformance_<n>
   POST /__reset           -> clears hit counters and created jobs
-Every request is appended to log.jsonl (method, path, query, selected headers).
+Every request is appended to the log file (method, path, query, selected headers).
 
-Run: python3 -I server.py <spec> <port> <logfile>
+Run: python3 -I mock_server.py <spec> <port> <logfile>
 """
 import json, sys, time, re
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -42,7 +47,15 @@ def resolve(s):
     return s
 
 
-def synth(s, key=""):
+def job_of(status):
+    """A synthesized job in one status, from that status's own variant schema."""
+    name = {"waiting": "JobWaiting", "running": "JobRunning", "complete": "JobComplete", "failed": "JobFailed"}[status]
+    return synth({"$ref": f"#/components/schemas/{name}"})
+
+
+def synth(s, key="", depth=0):
+    if depth > 12:  # a recursive schema must not hang the mock
+        return {}
     s = resolve(s)
     if "example" in s:
         return s["example"]
@@ -50,11 +63,11 @@ def synth(s, key=""):
         return s["default"]
     for k in ("oneOf", "anyOf"):
         if k in s:
-            return synth(s[k][0], key)
+            return synth(s[k][0], key, depth + 1)
     if "allOf" in s:
         out = {}
         for part in s["allOf"]:
-            v = synth(part, key)
+            v = synth(part, key, depth + 1)
             if isinstance(v, dict):
                 out.update(v)
         return out
@@ -66,13 +79,14 @@ def synth(s, key=""):
     if isinstance(t, list):
         t = next((x for x in t if x != "null"), "null")
     if t == "object" or "properties" in s:
-        return {k: synth(v, k) for k, v in s.get("properties", {}).items()}
+        return {k: synth(v, k, depth + 1) for k, v in s.get("properties", {}).items()}
     if t == "array":
-        return [synth(s.get("items", {}), key)]
+        return [synth(s.get("items", {}), key, depth + 1)]
+    timestamp = key.endswith("At") or key.endswith("_at")
     if t == "integer":
-        return 1731000000000 if "at" in key.lower() else 1
+        return 1731000000000 if timestamp else 1
     if t == "number":
-        return 1.5
+        return 1731000000000 if timestamp else 1.5
     if t == "boolean":
         return True
     if t == "null":
@@ -158,6 +172,8 @@ class H(BaseHTTPRequestHandler):
                 req = json.loads(body or b"{}")
             except ValueError:
                 return self.send(400, err("VALIDATION_ERROR", "Body is not JSON"))
+            if not isinstance(req, dict) or not isinstance(req.get("type"), str) or not isinstance(req.get("params", {}), dict):
+                return self.send(400, err("VALIDATION_ERROR", "A submit needs a string type and an object params"))
             key = req.get("idempotencyKey")
             if key is not None and key in CREATED:
                 return self.send(200, {"data": {"id": CREATED[key], "status": "waiting", "idempotent": True}})
@@ -181,12 +197,21 @@ class H(BaseHTTPRequestHandler):
             if p == "/jobs/{id}" and method == "GET":
                 if arg == "job_404":
                     return self.send(404, err("NOT_FOUND", "Job not found"))
+                if arg == "job_409":
+                    return self.send(409, err("CONFLICT", "The job is in a state that does not allow this"))
                 if arg == "job_503":
                     return self.send(503, err("SERVICE_UNAVAILABLE", "Try again"))
                 if arg == "job_flaky" and HITS[u.path] == 1:
                     return self.send(429, err("RATE_LIMITED", "Slow down"), {"Retry-After": "1"})
                 if arg == "job_slow":
                     time.sleep(6)
+                status = {"job_done": "complete", "job_failed": "failed"}.get(arg)
+                if status is None and arg in CREATED.values():
+                    status = "running" if HITS[u.path] == 1 else "complete"
+                if status is not None:
+                    job = job_of(status)
+                    job["id"] = arg
+                    return self.send(200, {"data": job})
             if p == "/jobs/{id}/download":
                 return self.send(200, raw=b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 1012, ctype="video/mp4")
             status, payload = success(op)

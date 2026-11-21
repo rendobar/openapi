@@ -17,4 +17,5 @@ jobs:
           python3 -I conformance/mock_server.py openapi.json 4100 requests.jsonl &
           for i in $(seq 1 20); do curl -sf -X POST http://127.0.0.1:4100/__reset && break; sleep 0.5; done
           curl -sf http://127.0.0.1:4100/jobs/types > /dev/null
+          curl -sf -H "Authorization: Bearer k" http://127.0.0.1:4100/jobs/job_done > /dev/null
           python3 -c "import json;json.load(open('conformance/webhook-vectors.json'))"
