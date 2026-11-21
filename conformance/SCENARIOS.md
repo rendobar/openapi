@@ -12,9 +12,14 @@ row names for the others).
 
 | call | does |
 |---|---|
-| `POST /__reset` | clears hit counters, created jobs and the request list. Each flag set to `1` in the query arms one behaviour: `lose_submit`, `stall_submit`, `phantom_total`, `cancel_created` |
+| `POST /__reset` | clears hit counters, created jobs and the request list. Each flag set to `1` in the query arms one behaviour: `lose_submit`, `stall_submit`, `phantom_total`, `cancel_created`, `archive_created` |
 | `GET /__created` | `{data: {count}}`, the jobs `POST /jobs` created since the reset |
 | `GET /__requests` | `{data: [{method, path, query, idempotencyKey}]}`, every request since the reset except `/__` calls, in arrival order, with the path exactly as sent |
+
+Every job the mock returns carries `terminal`, as the API does: `true` for
+`complete`, `failed`, `cancelled` and the unknown `archived`, `false` for
+`waiting`, `dispatched`, `running` and the unknown `paused`. Counts, bytes,
+nanodollars and timestamps are integers, as the spec types them.
 
 "No request" in a row means `GET /__requests` returns an empty list. A count of
 requests to a path also comes from `/__requests`.
@@ -72,9 +77,10 @@ Timings are wall clock, measured around the SDK call.
 | C34 | `wait("job_stuck")` with a 3 s timeout (the job stays `running`) | raise a typed wait-timeout error at 2.5 to 5 s carrying job id `job_stuck`, last status `running` and the last job read (id `job_stuck`) | |
 | C35 | `wait("job_cancelled")` with default options, then `run` an `ffprobe` job after `/__reset?cancel_created=1` (the job reads `running`, then `cancelled`) | `wait` returns the job with status `cancelled`. `run` raises a typed job-failed error with code `JOB_CANCELLED` carrying the job, status `cancelled`. A cancelled job has no `error` object, so the SDK supplies the code | |
 | C36 | `getJob("job_slow")` with a 2 s timeout and default retries | raise a timeout error at 1.8 to 4 s after exactly 1 request (a timed-out attempt is not retried) | typescript |
-| C37 | `wait("job_future")` with a 3 s timeout (status `paused`, unknown to the SDK) | not raise on the unknown status. Raise the wait-timeout error at 2.5 to 5 s with last status `paused` | |
+| C37 | `wait("job_future")` with a 3 s timeout (status `paused`, unknown to the SDK, `terminal: false`) | not raise on the unknown status. Raise the wait-timeout error at 2.5 to 5 s with last status `paused` | |
 | C38 | client with app name `conformance`, then `getJob("job_x")` | send `X-Rendobar-Client: <lang>/<version> (<runtime>/<runtime version>; app/conformance)`, where `<lang>` is the C11 prefix and `<version>` equals the version in the package manifest (`package.json`, `pyproject.toml`, Go `version.go`) | |
 | C39 | every case in `webhook-vectors.json`, including the bare-hex signature, the whitespace-only secret, a timestamp 301 s in the future and one exactly 300 s old | return each case's `expect`. Skip a case whose `notFor` names the SDK | typescript: the bare-hex case only |
+| C40 | `wait("job_future_done")` (status `archived`, unknown to the SDK, `terminal: true`), then `run` an `ffprobe` job after `/__reset?archive_created=1` (the job reads `running`, then `archived` with `terminal: true`) | `wait` ends on `terminal` without waiting out its timeout and returns the job, exposing the unknown status `archived`. `run` raises the typed job-failed error carrying the job, status `archived`, and does not return it as a success. This scenario does not fix the error's code | |
 
 An SDK reports results as JSON `{ "C01": "pass" | "n/a" | "fail: <why>", ... }`
 and CI fails on any id that is missing, `fail`, or `n/a` where the row does not
