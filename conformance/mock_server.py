@@ -26,10 +26,10 @@ deserializer sees data the spec says is valid. Scenario ids exercise behaviour:
                             /__reset?phantom_total=1 the total stays 120 but no job
                             exists from offset 60
   GET /jobs/{id}/download -> 1 KiB of bytes, video/mp4
-  POST /jobs              -> 400 VALIDATION_ERROR with details [{path, message}] without
+  POST /jobs              -> 400 VALIDATION_ERROR with details [{path: [segments], message}] without
                              a string `type`, with non-object `params`, or with the
                              type "no_such_type"; dedupes on idempotencyKey like the
-                             real API, and a reused key whose type or params differ is
+                             real API, and a reused key whose type, inputs or params differ is
                              a 409 CONFLICT with details {jobId}; the first submit after
                              /__reset?lose_submit=1 is created and then answered with a
                              502 (lost response); the first submit after
@@ -56,7 +56,7 @@ SPEC = json.load(open(sys.argv[1]))
 PORT = int(sys.argv[2])
 LOG = sys.argv[3]
 HITS = {}
-CREATED = {}  # idempotency key -> (job id, hash of the submit's type and params)
+CREATED = {}  # idempotency key -> (job id, hash of the submit's type, inputs and params)
 CANCELLING = set()  # created job ids that end cancelled instead of complete
 REQUESTS = []  # every non-control request since the last reset
 FLAGS = ("lose_submit", "stall_submit", "phantom_total", "cancel_created")
@@ -151,6 +151,7 @@ def err(code, msg, details=None):
 
 
 def invalid(path, msg):
+    """A 400 body like the API's: each problem's path is a list of segments (a Zod issue path)."""
     return err("VALIDATION_ERROR", msg, [{"path": path, "message": msg}])
 
 
@@ -164,7 +165,7 @@ def body_key(body):
 
 
 def submit_hash(req):
-    return hashlib.sha256(json.dumps([req.get("type"), req.get("params", {})], sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([req.get("type"), req.get("inputs"), req.get("params", {})], sort_keys=True).encode()).hexdigest()
 
 
 class H(BaseHTTPRequestHandler):
@@ -222,19 +223,19 @@ class H(BaseHTTPRequestHandler):
             try:
                 req = json.loads(body or b"{}")
             except ValueError:
-                return self.send(400, invalid("", "Body is not JSON"))
+                return self.send(400, invalid([], "Body is not JSON"))
             if not isinstance(req, dict) or not isinstance(req.get("type"), str):
-                return self.send(400, invalid("type", "A submit needs a string type"))
+                return self.send(400, invalid(["type"], "A submit needs a string type"))
             if not isinstance(req.get("params", {}), dict):
-                return self.send(400, invalid("params", "params must be an object"))
+                return self.send(400, invalid(["params"], "params must be an object"))
             if req["type"] == "no_such_type":
-                return self.send(400, invalid("type", 'Unknown job type "no_such_type"'))
+                return self.send(400, invalid(["type"], 'Unknown job type "no_such_type"'))
             key = req.get("idempotencyKey")
             if key is not None and key in CREATED:
                 job_id, digest = CREATED[key]
                 if digest != submit_hash(req):
                     return self.send(409, err("CONFLICT", f'Idempotency key "{key}" is already bound to job {job_id}, '
-                                              "submitted with a different type or params. Use a new key.", {"jobId": job_id}))
+                                              "submitted with a different type, inputs or params. Use a new key.", {"jobId": job_id}))
                 return self.send(200, {"data": {"id": job_id, "status": "waiting", "idempotent": True}})
             job_id = f"job_{len(CREATED) + 1:04d}"
             CREATED[key if key is not None else f"__nokey_{job_id}"] = (job_id, submit_hash(req))
